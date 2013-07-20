@@ -14,15 +14,18 @@
                  :backend-conf {:server-name "ln.fatlj.me" :server-port 2000}
                  :backend-channel (atom nil)
                  :listen-channel (atom nil)
-                 :connection-map (ref {}))))
+                 :connection-map (ref {})
+                 :uuid (java.util.UUID/randomUUID)
+                 :connection-id (atom 1))))
+
 
 (defn server-handler [channel client-info]
-  (println client-info)
-  (dosync (alter (:connection-map @local-info) assoc client-info channel))
-  (receive-all channel
-               #(do
-                  (println %)
-                  (enqueue @(:backend-channel @local-info) "hello" %))))
+  (let [cid (inc (swap! (:connection-id @local-info) inc))]
+    (dosync (alter (:connection-map @local-info) assoc cid channel))
+    (on-closed channel
+               #(dosync (alter (:connection-map @local-info) dissoc cid)))
+    (receive-all channel
+                 #(enqueue @(:backend-channel @local-info) "hello" %))))
 
 (defn start []
   (init-local-info)
