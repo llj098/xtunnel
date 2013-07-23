@@ -6,38 +6,66 @@
 
 (def local-info (ref {}))
 
+(defcodec fr (finite-frame :uint32
+                           (ordered-map
+                             :client-id :int64
+                             :id :uint32
+                             :cmd :byte
+                             :body (repeated :byte :prefix :none) )))
 
 (defn init-local-info []
   (dosync (alter local-info assoc
                  :local-conf {}
-                 :backend-conf {:server-name "ln.fatlj.me" :server-port 2000}
+                 :backend-conf {:server-name "localhost"
+                                :server-port 9998
+                                :frame fr}
                  :backend-channel (atom nil)
                  :listen-channel (atom nil)
                  :connection-map (ref {})
-                 :client-id (java.util.UUID/randomUUID)
+;                 :client-id (java.util.UUID/randomUUID)
                  :client-id (atom 1))))
 
-(defcodec fr (finite-frame
-             :uint32
-             {:client-id :int64 :id :uint32 :cmd :byte :body (repeated :byte) }))
 
-(defn server-handler [channel client-info]
-  (let [cid (inc (swap! (:client-id @local-info) inc))]
-    (dosync (alter (:connection-map @local-info) assoc cid channel))
-    (on-closed channel
-               #(dosync (alter (:connection-map @local-info) dissoc cid)))
-    (receive-all channel
-                 #(enqueue @(:backend-channel @local-info) "hello" %))))
+(defn local-handler [channel client-info]
+  (let [cid (swap! (:client-id @local-info) inc)]
+    (dosync
+     (alter (:connection-map @local-info)
+            assoc cid channel))
 
-(defn start []
+    (on-closed
+     channel
+     #(dosync (alter (:connection-map @local-info) dissoc cid)))
+
+    (receive-all
+     channel
+     #(enqueue @(:backend-channel @local-info)
+               {:client-id 10 :id cid :cmd 1 :body %}))))
+
+
+(defn start-local []
   (init-local-info)
-  (let [up-channel (wait-for-result (tcp-client (:backend-conf @local-info)) 5000)]
-    (swap! (:backend-channel @local-info)  (fn [_] up-channel))
-    (receive-all @(:backend-channel @local-info)
-                 #(enqueue (first (vals @(:connection-map @local-info))) %))
-    (on-closed up-channel #(swap! (:backend-channel @local-info) (fn [_] nil)))
+  (let [remote-channel (wait-for-result
+                    (tcp-client (:backend-conf @local-info))
+                    5000)]
+    (receive-all
+     remote-channel
+     #(let [conn-id (:id %)
+            client-channel
+            (get @(:connection-map @local-info) conn-id)]
+        (if-not (closed? client-channel)
+          (enqueue client-channel (:body %)))))
+
+    (on-closed
+     remote-channel
+     ;;todo we need to reconnect
+     #(swap! (:backend-channel @local-info) (fn [_] nil)))
+
+    (swap! (:backend-channel @local-info)
+           (fn [_] remote-channel))
+
     (swap! (:listen-channel @local-info)
-           (fn [_] (start-tcp-server server-handler {:port 9999})))))
+           (fn [_] (start-tcp-server
+                   local-handler {:port 9999})))))
 
 
 ;;message frame between xtunnel-local and xtunnel-server
@@ -71,12 +99,12 @@
   (dosync (alter cmap dissoc cid)))
 
 
-(defn init-socks-channel [ch sock-ch client-id connection-id]
+(defn init-socks-channel [ch sock-ch connection-id]
   (on-closed
    sock-ch
    (enqueue
     ch
-    (encode fr {:client-id client-id
+    (encode fr {:client-id ch
                 :id connection-id
                 :cmd 0 :body []})))
 
@@ -84,19 +112,15 @@
    sock-ch
    (fn [d] (enqueue
            channel
-           (encode fr {:client-id client-id
+           (encode fr {:client-id ch
                        :id connection-id
                        :cmd 1 :body d})))))
 
-
 (defn remote-server-handler [channel client-info]
-
   (receive-all
    channel
-   #(;;first connection first xtunnel-local
-     (let [client-id (:client-id %)
-           connection-id (:id %)
-           conn-map (getadd-conn-map client-id)
+   #((let [connection-id (:id %)
+           conn-map (getadd-conn-map channel)
            ch (get @conn-map (:id %))]
        (if ch
          (if (zero? (:cmd %))
@@ -105,12 +129,19 @@
          (let [sock-ch
                (wait-for-result
                 (tcp-client @(:socks-conf @remote-info)))]
-           (init-socks-channel ch sock-ch client-id connection-id)
+           (init-socks-channel ch sock-ch connection-id)
            (enqueue sock-ch (:body %)))))))
 
-  (on-closed channel nil))
+  (on-closed  channel
+              #(doseq [sock-ch
+                       (vals (get (:client-map @remote-info)
+                                  channel))]
+                 (close sock-ch)))
+
+  (getadd-conn-map channel))
 
 (defn start-remote []
   (init-remote-info)
   (swap! (:listen-channel @remote-info)
-         (fn [_] (start-tcp-server remote-server-handler {:port 9870 :frame fr}))))
+         (fn [_] (start-tcp-server
+                 remote-server-handler {:port 9870 :frame fr}))))
