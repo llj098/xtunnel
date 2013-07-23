@@ -25,22 +25,18 @@
 ;                 :client-id (java.util.UUID/randomUUID)
                  :client-id (atom 1))))
 
-
 (defn local-handler [channel client-info]
-  (let [cid (swap! (:client-id @local-info) inc)]
-    (dosync
-     (alter (:connection-map @local-info)
-            assoc cid channel))
+  (let [cid (swap! (:client-id @local-info) inc)
+        remote-channel (:backend-channel @local-info)
+        conn-map (:connection-map @local-info)]
 
-    (on-closed
-     channel
-     #(dosync (alter (:connection-map @local-info) dissoc cid)))
+    (dosync (alter conn-map assoc cid channel))
+    (on-closed channel #(dosync (alter conn-map dissoc cid)))
 
-    (receive-all
-     channel
-     #(enqueue @(:backend-channel @local-info)
-               {:client-id 10 :id cid :cmd 1 :body %}))))
-
+    (receive-all channel
+                 #(enqueue
+                   @remote-channel
+                   {:client-id 0 :id cid :cmd 1 :body %}))))
 
 (defn start-local []
   (init-local-info)
