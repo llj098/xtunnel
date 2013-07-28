@@ -6,9 +6,16 @@
 
 (def local-info (ref {}))
 
+
+(defn mirror-handler [ch info]
+  (join ch ch))
+
+(defn start-mirror []
+  (start-tcp-server mirror-handler {:port 9999}))
+
 (defcodec fr (finite-frame :uint32
                            (ordered-map
-                             :client-id :int64
+                             :client-id :int32
                              :id :uint32
                              :cmd :byte
                              :body (repeated :byte :prefix :none) )))
@@ -17,51 +24,48 @@
   (dosync (alter local-info assoc
                  :local-conf {}
                  :backend-conf {:server-name "localhost"
-                                :server-port 9998
+                                :server-port 9999
                                 :frame fr}
-                 :backend-channel (atom nil)
-                 :listen-channel (atom nil)
                  :connection-map (ref {})
-;                 :client-id (java.util.UUID/randomUUID)
-                 :client-id (atom 1))))
+                 :client-id (atom 0))))
 
 (defn local-handler [channel client-info]
-  (let [cid (swap! (:client-id @local-info) inc)
-        remote-channel (:backend-channel @local-info)
-        conn-map (:connection-map @local-info)]
-
-    (dosync (alter conn-map assoc cid channel))
-    (on-closed channel #(dosync (alter conn-map dissoc cid)))
-
+  (println "new connection coming")
+  (let [cid (swap! (:client-id @local-info) inc)]
     (receive-all channel
                  #(enqueue
-                   @remote-channel
-                   {:client-id 0 :id cid :cmd 1 :body %}))))
+                   (:remote-channel @local-info)
+                   {:client-id 1 :cmd 2 :id cid :body (seq (.array %))}))
+    (on-closed channel
+               #(dosync (alter (:connection-map @local-info) dissoc cid)))
+    (dosync (alter (:connection-map @local-info) assoc cid channel))))
 
-(defn start-local []
+(defn timer [interval fn & args]
+  (future (doseq [f (repeatedly #(apply fn args))]
+            (Thread/sleep interval))))
+
+(defn start-local! []
   (init-local-info)
-  (let [remote-channel (wait-for-result
+  (if-let [remote-channel (wait-for-result
                     (tcp-client (:backend-conf @local-info))
                     5000)]
-    (receive-all
-     remote-channel
-     #(let [conn-id (:id %)
-            client-channel
-            (get @(:connection-map @local-info) conn-id)]
-        (if-not (closed? client-channel)
-          (enqueue client-channel (:body %)))))
+    (do
+      (dosync (alter local-info assoc :remote-channel remote-channel))
+      (receive-all remote-channel
+                   #((println %)
+                     (if-let [client-ch (get @(:connection-map @local-info)
+                                             (:id %))]
+                       (enqueue client-ch (byte-array (map byte (:body %)))))))
 
-    (on-closed
-     remote-channel
-     ;;todo we need to reconnect
-     #(swap! (:backend-channel @local-info) (fn [_] nil)))
+      (if-let [stop-fn (start-tcp-server local-handler {:port 9996})]
+        (dosync (alter local-info assoc :stop-listen stop-fn))))))
 
-    (swap! (:backend-channel @local-info)
-           (fn [_] remote-channel))
+(defn stop-local! []
+  (if-let [ch (:remote-channel @local-info)]
+    (close ch))
 
-    (swap! (:listen-channel @local-info)
-           (fn [_] (start-tcp-server
-                   local-handler {:port 9999})))))
+  (if-let [stop-fn (:stop-listen @local-info)]
+    (stop-fn)))
 
 
 ;;message frame between xtunnel-local and xtunnel-server
